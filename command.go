@@ -133,6 +133,24 @@ func Publish(topic string, body []byte) *Command {
 	return &Command{[]byte("PUB"), params, body}
 }
 
+// PublishPre creates a new Command to write a message to a given topic
+func PublishDtPre(topic string, body []byte) *Command {
+	var params = [][]byte{[]byte(topic)}
+	return &Command{[]byte("PUBPRE"), params, body}
+}
+
+// PublishCmt creates a new Command to write a message to a given topic
+func PublishDtCmt(topic string, body []byte) *Command {
+	var params = [][]byte{[]byte(topic)}
+	return &Command{[]byte("PUBCMT"), params, body}
+}
+
+// PublishCnl creates a new Command to write a message to a given topic
+func PublishDtCnl(topic string, body []byte) *Command {
+	var params = [][]byte{[]byte(topic)}
+	return &Command{[]byte("PUBCNL"), params, body}
+}
+
 // DeferredPublish creates a new Command to write a message to a given topic
 // where the message will queue at the channel level until the timeout expires
 func DeferredPublish(topic string, delay time.Duration, body []byte) *Command {

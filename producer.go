@@ -55,6 +55,7 @@ type ProducerTransaction struct {
 	doneChan chan *ProducerTransaction
 	Error    error         // the error (or nil) of the publish command
 	Args     []interface{} // the slice of variadic arguments passed to PublishAsync or MultiPublishAsync
+	Response []byte
 }
 
 func (t *ProducerTransaction) finish() {
@@ -183,6 +184,45 @@ func (w *Producer) MultiPublishAsync(topic string, body [][]byte, doneChan chan 
 // an error if publish failed
 func (w *Producer) Publish(topic string, body []byte) error {
 	return w.sendCommand(Publish(topic, body))
+}
+
+// PublishDtPre synchronously publishes a message body to the specified topic, returning
+// an error if publish failed
+func (w *Producer) PublishDtPre(topic string, body []byte) ([]byte, error) {
+	doneChan := make(chan *ProducerTransaction)
+	err := w.sendCommandAsync(PublishDtPre(topic, body), doneChan, nil)
+	if err != nil {
+		close(doneChan)
+		return nil, err
+	}
+	t := <-doneChan
+	return t.Response, t.Error
+}
+
+// PublishDtCmt synchronously publishes a message body to the specified topic, returning
+// an error if publish failed
+func (w *Producer) PublishDtCmt(topic string, body []byte) ([]byte, error) {
+	doneChan := make(chan *ProducerTransaction)
+	err := w.sendCommandAsync(PublishDtCmt(topic, body), doneChan, nil)
+	if err != nil {
+		close(doneChan)
+		return nil, err
+	}
+	t := <-doneChan
+	return t.Response, t.Error
+}
+
+// PublishDtCnl synchronously publishes a message body to the specified topic, returning
+// an error if publish failed
+func (w *Producer) PublishDtCnl(topic string, body []byte) ([]byte, error) {
+	doneChan := make(chan *ProducerTransaction)
+	err := w.sendCommandAsync(PublishDtCnl(topic, body), doneChan, nil)
+	if err != nil {
+		close(doneChan)
+		return nil, err
+	}
+	t := <-doneChan
+	return t.Response, t.Error
 }
 
 // MultiPublish synchronously publishes a slice of message bodies to the specified topic, returning
@@ -337,6 +377,8 @@ func (w *Producer) popTransaction(frameType int32, data []byte) {
 	w.transactions = w.transactions[1:]
 	if frameType == FrameTypeError {
 		t.Error = ErrProtocol{string(data)}
+	} else {
+		t.Response = data
 	}
 	t.finish()
 }

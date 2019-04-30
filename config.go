@@ -178,6 +178,9 @@ type Config struct {
 
 	// secret for nsqd authentication (requires nsqd 0.2.29+)
 	AuthSecret string `opt:"auth_secret"`
+
+	// Identify Agreement Version
+	AgreementVersion string `opt:"agreement_version" default:"V2"`
 }
 
 // NewConfig returns a new default nsq configuration.

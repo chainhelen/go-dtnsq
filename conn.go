@@ -153,7 +153,16 @@ func (c *Conn) Connect() (*IdentifyResponse, error) {
 	c.r = conn
 	c.w = conn
 
-	_, err = c.Write(MagicV2)
+	magicBytes := []byte("    ")
+	switch c.config.AgreementVersion {
+	case "V1":
+		magicBytes = MagicV1
+	case "V2":
+		magicBytes = MagicV2
+	case "DT":
+		magicBytes = MagicDT
+	}
+	_, err = c.Write(magicBytes)
 	if err != nil {
 		c.Close()
 		return nil, fmt.Errorf("[%s] failed to write magic - %s", c.addr, err)
