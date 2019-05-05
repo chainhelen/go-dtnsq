@@ -127,7 +127,7 @@ type producerConnDelegate struct {
 
 func (d *producerConnDelegate) OnResponse(c *Conn, data []byte)       { d.w.onConnResponse(c, data) }
 func (d *producerConnDelegate) OnError(c *Conn, data []byte)          { d.w.onConnError(c, data) }
-func (d *producerConnDelegate) OnMessage(c *Conn, m *Message)         {}
+func (d *producerConnDelegate) OnMessage(c *Conn, m *Message)         { d.w.onConnMessage(c, m) }
 func (d *producerConnDelegate) OnMessageFinished(c *Conn, m *Message) {}
 func (d *producerConnDelegate) OnMessageRequeued(c *Conn, m *Message) {}
 func (d *producerConnDelegate) OnBackoff(c *Conn)                     {}

@@ -32,9 +32,10 @@ type Producer struct {
 	logLvl   LogLevel
 	logGuard sync.RWMutex
 
-	responseChan chan []byte
-	errorChan    chan []byte
-	closeChan    chan int
+	responseChan     chan []byte
+	incomingMessages chan *Message
+	errorChan        chan []byte
+	closeChan        chan int
 
 	transactionChan chan *ProducerTransaction
 	transactions    []*ProducerTransaction
@@ -45,6 +46,8 @@ type Producer struct {
 	exitChan            chan int
 	wg                  sync.WaitGroup
 	guard               sync.Mutex
+
+	checkBackHandler func(*Message) error
 }
 
 // ProducerTransaction is returned by the async publish methods
@@ -84,10 +87,11 @@ func NewProducer(addr string, config *Config) (*Producer, error) {
 		logger: log.New(os.Stderr, "", log.Flags()),
 		logLvl: LogLevelInfo,
 
-		transactionChan: make(chan *ProducerTransaction),
-		exitChan:        make(chan int),
-		responseChan:    make(chan []byte),
-		errorChan:       make(chan []byte),
+		transactionChan:  make(chan *ProducerTransaction),
+		exitChan:         make(chan int),
+		responseChan:     make(chan []byte),
+		incomingMessages: make(chan *Message),
+		errorChan:        make(chan []byte),
 	}
 	return p, nil
 }
@@ -357,6 +361,8 @@ func (w *Producer) router() {
 			}
 		case data := <-w.responseChan:
 			w.popTransaction(FrameTypeResponse, data)
+		case msg := <-w.incomingMessages:
+			w.HandleDtComingMessage(msg)
 		case data := <-w.errorChan:
 			w.popTransaction(FrameTypeError, data)
 		case <-w.closeChan:
@@ -370,6 +376,18 @@ exit:
 	w.transactionCleanup()
 	w.wg.Done()
 	w.log(LogLevelInfo, "exiting router")
+}
+
+func (w *Producer) SetCheckBackHandler(cb func(*Message) error) {
+	w.checkBackHandler = cb
+}
+
+func (w *Producer) HandleDtComingMessage(msg *Message) {
+	if err := w.checkBackHandler(msg); err != nil {
+		w.log(LogLevelError, "HandleDtComingMessage msg:%s, err:%s", msg, err)
+		return
+	}
+	w.log(LogLevelDebug, "HandleDtComingMessage msg:%s", msg)
 }
 
 func (w *Producer) popTransaction(frameType int32, data []byte) {
@@ -425,6 +443,7 @@ func (w *Producer) log(lvl LogLevel, line string, args ...interface{}) {
 }
 
 func (w *Producer) onConnResponse(c *Conn, data []byte) { w.responseChan <- data }
+func (w *Producer) onConnMessage(c *Conn, msg *Message) { w.incomingMessages <- msg }
 func (w *Producer) onConnError(c *Conn, data []byte)    { w.errorChan <- data }
 func (w *Producer) onConnHeartbeat(c *Conn)             {}
 func (w *Producer) onConnIOError(c *Conn, err error)    { w.close() }
