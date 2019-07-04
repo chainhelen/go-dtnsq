@@ -1,4 +1,4 @@
-module github.com/nsqio/go-nsq
+module github.com/chainhelen/go-dtnsq
 
 go 1.11
 
