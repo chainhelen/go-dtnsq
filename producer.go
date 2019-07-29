@@ -1,9 +1,14 @@
 package nsq
 
 import (
+	"errors"
 	"fmt"
 	"log"
+	"net"
+	"net/url"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -25,8 +30,13 @@ type producerConn interface {
 type Producer struct {
 	id     int64
 	addr   string
-	conn   producerConn
 	config Config
+
+	// query nsqd instance for each topic assigned by lookupd
+	lookupdHTTPAddrs   []string
+	lookupdQueryIndex  int
+	nsqdConnections map[string]*Conn // map topic to conn
+	behaviorDelegate interface{}
 
 	logger   logger
 	logLvl   LogLevel
@@ -35,17 +45,15 @@ type Producer struct {
 	responseChan     chan []byte
 	incomingMessages chan *Message
 	errorChan        chan []byte
-	closeChan        chan int
 
 	transactionChan chan *ProducerTransaction
 	transactions    []*ProducerTransaction
-	state           int32
 
 	concurrentProducers int32
 	stopFlag            int32
 	exitChan            chan int
 	wg                  sync.WaitGroup
-	guard               sync.Mutex
+	guard               sync.RWMutex
 
 	checkBackHandler func(*Message) error
 }
@@ -54,6 +62,7 @@ type Producer struct {
 // to retrieve metadata about the command after the
 // response is received.
 type ProducerTransaction struct {
+	topic    string
 	cmd      *Command
 	doneChan chan *ProducerTransaction
 	Error    error         // the error (or nil) of the publish command
@@ -84,6 +93,8 @@ func NewProducer(addr string, config *Config) (*Producer, error) {
 		addr:   addr,
 		config: *config,
 
+		nsqdConnections: make(map[string]*Conn),
+
 		logger: log.New(os.Stderr, "", log.Flags()),
 		logLvl: LogLevelInfo,
 
@@ -92,8 +103,63 @@ func NewProducer(addr string, config *Config) (*Producer, error) {
 		responseChan:     make(chan []byte),
 		incomingMessages: make(chan *Message),
 		errorChan:        make(chan []byte),
+		// closeChan:        make(chan int),
+
 	}
+	p.wg.Add(1)
+	go p.router()
 	return p, nil
+}
+
+func (w *Producer) ConnectToNSQLookupd(addr string) error {
+	if err := validatedLookupAddr(addr); err != nil {
+		return err
+	}
+
+	w.guard.Lock()
+	defer 	w.guard.Unlock()
+
+	for _, x := range w.lookupdHTTPAddrs {
+		if x == addr {
+			return nil
+		}
+	}
+	w.lookupdHTTPAddrs = append(w.lookupdHTTPAddrs, addr)
+	return nil
+}
+
+func (w *Producer) ConnectToNSQLookupds(addresses []string) error {
+	for _, addr := range addresses {
+		err := w.ConnectToNSQLookupd(addr)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (w *Producer) SetBehaviorDelegate(cb interface{}) {
+	matched := false
+
+	if _, ok := cb.(DiscoveryFilter); ok {
+		matched = true
+	}
+
+	if !matched {
+		panic("behavior delegate does not have any recognized methods")
+	}
+
+	w.behaviorDelegate = cb
+}
+
+func (w *Producer) nextLookupdAddr() string {
+	if w.lookupdQueryIndex >= len(w.lookupdHTTPAddrs) {
+		w.lookupdQueryIndex = 0
+	}
+	addr := w.lookupdHTTPAddrs[w.lookupdQueryIndex]
+	num := len(w.lookupdHTTPAddrs)
+	w.lookupdQueryIndex = (w.lookupdQueryIndex + 1) % num
+	return addr
 }
 
 // Ping causes the Producer to connect to it's configured nsqd (if not already
@@ -103,14 +169,12 @@ func NewProducer(addr string, config *Config) (*Producer, error) {
 // configured correctly, rather than relying on the lazy "connect on Publish"
 // behavior of a Producer.
 func (w *Producer) Ping() error {
-	if atomic.LoadInt32(&w.state) != StateConnected {
-		err := w.connect()
-		if err != nil {
-			return err
-		}
+	err := w.connect("")
+	if err != nil {
+		return err
 	}
 
-	return w.conn.WriteCommand(Nop())
+	return w.nsqdConnections[""].WriteCommand(Nop())
 }
 
 // SetLogger assigns the logger to use as well as a level
@@ -165,7 +229,7 @@ func (w *Producer) Stop() {
 // and the response error if present
 func (w *Producer) PublishAsync(topic string, body []byte, doneChan chan *ProducerTransaction,
 	args ...interface{}) error {
-	return w.sendCommandAsync(Publish(topic, body), doneChan, args)
+	return w.sendCommandAsync(topic, Publish(topic, body), doneChan, args)
 }
 
 // MultiPublishAsync publishes a slice of message bodies to the specified topic
@@ -181,20 +245,20 @@ func (w *Producer) MultiPublishAsync(topic string, body [][]byte, doneChan chan 
 	if err != nil {
 		return err
 	}
-	return w.sendCommandAsync(cmd, doneChan, args)
+	return w.sendCommandAsync(topic, cmd, doneChan, args)
 }
 
 // Publish synchronously publishes a message body to the specified topic, returning
 // an error if publish failed
 func (w *Producer) Publish(topic string, body []byte) error {
-	return w.sendCommand(Publish(topic, body))
+	return w.sendCommand(topic, Publish(topic, body))
 }
 
 // PublishDtPre synchronously publishes a message body to the specified topic, returning
 // an error if publish failed
 func (w *Producer) PublishDtPre(topic string, body []byte) ([]byte, error) {
 	doneChan := make(chan *ProducerTransaction)
-	err := w.sendCommandAsync(PublishDtPre(topic, body), doneChan, nil)
+	err := w.sendCommandAsync(topic, PublishDtPre(topic, body), doneChan, nil)
 	if err != nil {
 		close(doneChan)
 		return nil, err
@@ -207,7 +271,7 @@ func (w *Producer) PublishDtPre(topic string, body []byte) ([]byte, error) {
 // an error if publish failed
 func (w *Producer) PublishDtCmt(topic string, body []byte) ([]byte, error) {
 	doneChan := make(chan *ProducerTransaction)
-	err := w.sendCommandAsync(PublishDtCmt(topic, body), doneChan, nil)
+	err := w.sendCommandAsync(topic, PublishDtCmt(topic, body), doneChan, nil)
 	if err != nil {
 		close(doneChan)
 		return nil, err
@@ -220,7 +284,7 @@ func (w *Producer) PublishDtCmt(topic string, body []byte) ([]byte, error) {
 // an error if publish failed
 func (w *Producer) PublishDtCnl(topic string, body []byte) ([]byte, error) {
 	doneChan := make(chan *ProducerTransaction)
-	err := w.sendCommandAsync(PublishDtCnl(topic, body), doneChan, nil)
+	err := w.sendCommandAsync(topic, PublishDtCnl(topic, body), doneChan, nil)
 	if err != nil {
 		close(doneChan)
 		return nil, err
@@ -236,14 +300,14 @@ func (w *Producer) MultiPublish(topic string, body [][]byte) error {
 	if err != nil {
 		return err
 	}
-	return w.sendCommand(cmd)
+	return w.sendCommand(topic, cmd)
 }
 
 // DeferredPublish synchronously publishes a message body to the specified topic
 // where the message will queue at the channel level until the timeout expires, returning
 // an error if publish failed
 func (w *Producer) DeferredPublish(topic string, delay time.Duration, body []byte) error {
-	return w.sendCommand(DeferredPublish(topic, delay, body))
+	return w.sendCommand(topic, DeferredPublish(topic, delay, body))
 }
 
 // DeferredPublishAsync publishes a message body to the specified topic
@@ -256,12 +320,12 @@ func (w *Producer) DeferredPublish(topic string, delay time.Duration, body []byt
 // and the response error if present
 func (w *Producer) DeferredPublishAsync(topic string, delay time.Duration, body []byte,
 	doneChan chan *ProducerTransaction, args ...interface{}) error {
-	return w.sendCommandAsync(DeferredPublish(topic, delay, body), doneChan, args)
+	return w.sendCommandAsync(topic, DeferredPublish(topic, delay, body), doneChan, args)
 }
 
-func (w *Producer) sendCommand(cmd *Command) error {
+func (w *Producer) sendCommand(topic string, cmd *Command) error {
 	doneChan := make(chan *ProducerTransaction)
-	err := w.sendCommandAsync(cmd, doneChan, nil)
+	err := w.sendCommandAsync(topic, cmd, doneChan, nil)
 	if err != nil {
 		close(doneChan)
 		return err
@@ -270,21 +334,19 @@ func (w *Producer) sendCommand(cmd *Command) error {
 	return t.Error
 }
 
-func (w *Producer) sendCommandAsync(cmd *Command, doneChan chan *ProducerTransaction,
+func (w *Producer) sendCommandAsync(topic string, cmd *Command, doneChan chan *ProducerTransaction,
 	args []interface{}) error {
 	// keep track of how many outstanding producers we're dealing with
 	// in order to later ensure that we clean them all up...
 	atomic.AddInt32(&w.concurrentProducers, 1)
 	defer atomic.AddInt32(&w.concurrentProducers, -1)
 
-	if atomic.LoadInt32(&w.state) != StateConnected {
-		err := w.connect()
-		if err != nil {
-			return err
-		}
+	if err := w.connect(topic); err != nil {
+		return err
 	}
 
 	t := &ProducerTransaction{
+		topic:    topic,
 		cmd:      cmd,
 		doneChan: doneChan,
 		Args:     args,
@@ -299,7 +361,14 @@ func (w *Producer) sendCommandAsync(cmd *Command, doneChan chan *ProducerTransac
 	return nil
 }
 
-func (w *Producer) connect() error {
+func (w *Producer) connect(topic string) error {
+	w.guard.RLock()
+	if _, ok := w.nsqdConnections[topic]; ok {
+		w.guard.RUnlock()
+		return nil
+	}
+	w.guard.RUnlock()
+
 	w.guard.Lock()
 	defer w.guard.Unlock()
 
@@ -307,46 +376,121 @@ func (w *Producer) connect() error {
 		return ErrStopped
 	}
 
-	switch state := atomic.LoadInt32(&w.state); state {
-	case StateInit:
-	case StateConnected:
-		return nil
-	default:
-		return ErrNotConnected
+	addr, err := w.getNSQD(topic)
+	if err != nil {
+		w.log(LogLevelError, "error getting nsqd addr for topic(%s) - %s", topic, err)
+		return err
 	}
 
-	w.log(LogLevelInfo, "(%s) connecting to nsqd", w.addr)
+	w.log(LogLevelInfo, "(%s) connecting to nsqd", addr)
 
 	logger, logLvl := w.getLogger()
 
-	w.conn = NewConn(w.addr, &w.config, &producerConnDelegate{w})
-	w.conn.SetLogger(logger, logLvl, fmt.Sprintf("%3d (%%s)", w.id))
-
-	_, err := w.conn.Connect()
+	conn := NewConn(addr, &w.config, &producerConnDelegate{w})
+	conn.SetLogger(logger, logLvl, fmt.Sprintf("%3d (%%s)", w.id))
+	_, err = conn.Connect()
 	if err != nil {
-		w.conn.Close()
-		w.log(LogLevelError, "(%s) error connecting to nsqd - %s", w.addr, err)
+		_ = conn.Close()
+		w.log(LogLevelError, "(%s) error connecting to nsqd - %s", addr, err)
 		return err
 	}
-	atomic.StoreInt32(&w.state, StateConnected)
-	w.closeChan = make(chan int)
-	w.wg.Add(1)
-	go w.router()
+
+	w.nsqdConnections[topic] = conn
 
 	return nil
 }
 
-func (w *Producer) close() {
-	if !atomic.CompareAndSwapInt32(&w.state, StateConnected, StateDisconnected) {
-		return
+func (w *Producer) getNSQD(topic string) (string, error) {
+	if len(w.lookupdHTTPAddrs) == 0 {
+		return w.addr, nil
 	}
-	w.conn.Close()
-	go func() {
-		// we need to handle this in a goroutine so we don't
-		// block the caller from making progress
-		w.wg.Wait()
-		atomic.StoreInt32(&w.state, StateInit)
-	}()
+
+	lookupdAddr := w.nextLookupdAddr()
+	var addresses []string
+	var err error
+	if topic != "" {
+		endpoint := w.endpoint(lookupdAddr, "/lookup", map[string]string{"topic": topic})
+		addresses, _ = w.queryLookupd(endpoint)
+	}
+	if len(addresses) == 0 {
+		endpoint := w.endpoint(lookupdAddr, "/nodes", nil)
+		addresses, err = w.queryLookupd(endpoint)
+	}
+	if err != nil {
+		return "", err
+	}
+	if len(addresses) == 0 {
+		return "", errors.New("no nsqd found")
+	}
+	return addresses[0], nil
+}
+
+func (w *Producer) endpoint(addr, path string, args map[string]string) string {
+	urlString := addr
+	if !strings.Contains(urlString, "://") {
+		urlString = "http://" + addr
+	}
+
+	u, err := url.Parse(urlString)
+	if err != nil {
+		panic(err)
+	}
+	u.Path = path
+
+	if args != nil {
+		val, _ := url.ParseQuery(u.RawQuery)
+		for k, v := range args {
+			val.Add(k, v)
+		}
+		u.RawQuery = val.Encode()
+	}
+
+	return u.String()
+}
+
+func (w *Producer) queryLookupd(endpoint string) ([]string, error) {
+	w.log(LogLevelInfo, "querying nsqlookupd %s", endpoint)
+
+	var data lookupResp
+	err := apiRequestNegotiateV1("GET", endpoint, nil, &data)
+	if err != nil {
+		w.log(LogLevelError, "error querying nsqlookupd (%s) - %s", endpoint, err)
+		return nil, err
+	}
+
+	var nsqdAddrs []string
+	for _, producer := range data.Producers {
+		broadcastAddress := producer.BroadcastAddress
+		port := producer.TCPPort
+		joined := net.JoinHostPort(broadcastAddress, strconv.Itoa(port))
+		nsqdAddrs = append(nsqdAddrs, joined)
+	}
+	// apply filter
+	if discoveryFilter, ok := w.behaviorDelegate.(DiscoveryFilter); ok {
+		nsqdAddrs = discoveryFilter.Filter(nsqdAddrs)
+	}
+
+	return nsqdAddrs, nil
+}
+
+func (w *Producer) closeConn(c *Conn) {
+	w.guard.Lock()
+	defer w.guard.Unlock()
+
+	for topic, conn := range w.nsqdConnections {
+		if c == conn {
+			delete(w.nsqdConnections, topic)
+			break
+		}
+	}
+	_ = c.Close()
+}
+
+func (w *Producer) close() {
+	for topic, conn := range w.nsqdConnections {
+		delete(w.nsqdConnections, topic)
+		_ = conn.Close()
+	}
 }
 
 func (w *Producer) router() {
@@ -354,10 +498,11 @@ func (w *Producer) router() {
 		select {
 		case t := <-w.transactionChan:
 			w.transactions = append(w.transactions, t)
-			err := w.conn.WriteCommand(t.cmd)
+			conn := w.nsqdConnections[t.topic]
+			err := conn.WriteCommand(t.cmd)
 			if err != nil {
-				w.log(LogLevelError, "(%s) sending command - %s", w.conn.String(), err)
-				w.close()
+				w.log(LogLevelError, "(%s) sending command - %s", conn.String(), err)
+				w.closeConn(conn)
 			}
 		case data := <-w.responseChan:
 			w.popTransaction(FrameTypeResponse, data)
@@ -365,8 +510,6 @@ func (w *Producer) router() {
 			w.HandleDtComingMessage(msg)
 		case data := <-w.errorChan:
 			w.popTransaction(FrameTypeError, data)
-		case <-w.closeChan:
-			goto exit
 		case <-w.exitChan:
 			goto exit
 		}
@@ -446,9 +589,5 @@ func (w *Producer) onConnResponse(c *Conn, data []byte) { w.responseChan <- data
 func (w *Producer) onConnMessage(c *Conn, msg *Message) { w.incomingMessages <- msg }
 func (w *Producer) onConnError(c *Conn, data []byte)    { w.errorChan <- data }
 func (w *Producer) onConnHeartbeat(c *Conn)             {}
-func (w *Producer) onConnIOError(c *Conn, err error)    { w.close() }
-func (w *Producer) onConnClose(c *Conn) {
-	w.guard.Lock()
-	defer w.guard.Unlock()
-	close(w.closeChan)
-}
+func (w *Producer) onConnIOError(c *Conn, err error)    { w.closeConn(c) }
+func (w *Producer) onConnClose(c *Conn) { w.closeConn(c) }
